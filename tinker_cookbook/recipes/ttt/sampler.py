@@ -132,7 +132,7 @@ def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1
         elif env_type == "ac2":
             from tasks.alphaevolve_ac2.ae_verifier import evaluate_sequence
             initial_value = evaluate_sequence(construction) # Maximize lower bound
-    elif env_type == "gpu_mode":
+    elif env_type in {"gpu_mode", "trimul", "nvfp4_group_gemm", "mixed_mla"}:
         initial_value = -1_000_000 # Worse than max of initial distribution
     elif env_type in {"ahc039", "ahc058"}:
         initial_value = 0.0
@@ -174,6 +174,11 @@ def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1
         return GpuModeState(timestep=timestep, code="", value=initial_value)
     elif env_type == "nvfp4_group_gemm":
         return GpuModeState(timestep=timestep, code="", value=initial_value)
+    elif env_type == "mixed_mla":
+        from tasks.gpu_mode.initial_program_mixed_mla import INITIAL_CODE, INITIAL_VALUE
+        code = INITIAL_CODE
+        initial_value = INITIAL_VALUE
+        return GpuModeState(timestep=timestep, code=code, value=initial_value)
     elif env_type == "ahc039":
         if initial_exp_type == "best_available":
             from tasks.ale_bench.best_available import AHC039_BEST_CODE, AHC039_BEST_CODE_VALUE

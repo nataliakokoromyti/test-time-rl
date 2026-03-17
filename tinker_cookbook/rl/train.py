@@ -1428,12 +1428,15 @@ async def do_sync_training(
                     )
             }
         
-        if train_table is not None and isinstance(ml_logger.loggers[2], WandbLogger):
-            ml_logger.loggers[2].log_metrics(train_table, step=i_batch)
-        if test_table is not None and isinstance(ml_logger.loggers[2], WandbLogger):
-            ml_logger.loggers[2].log_metrics(test_table, step=i_batch)
-        if sampler_table_data is not None and isinstance(ml_logger.loggers[2], WandbLogger):
-            ml_logger.loggers[2].log_metrics({
+        _wandb_logger = None
+        if len(ml_logger.loggers) > 2 and isinstance(ml_logger.loggers[2], WandbLogger):
+            _wandb_logger = ml_logger.loggers[2]
+        if train_table is not None and _wandb_logger is not None:
+            _wandb_logger.log_metrics(train_table, step=i_batch)
+        if test_table is not None and _wandb_logger is not None:
+            _wandb_logger.log_metrics(test_table, step=i_batch)
+        if sampler_table_data is not None and _wandb_logger is not None:
+            _wandb_logger.log_metrics({
                 f"sampler_states_{i_batch}": wandb.Table(
                     columns=sampler_table_columns,
                     data=sampler_table_data

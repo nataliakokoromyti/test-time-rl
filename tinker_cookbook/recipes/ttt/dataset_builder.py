@@ -111,7 +111,7 @@ class SingleProblemDataset(RLDataset):
             case "erdos":
                 from tinker_cookbook.recipes.ttt.env_erdos import ErdosMinOverlapEnv
                 return ErdosMinOverlapEnv
-            case "trimul" | "mla_decode_nvidia" | "nvfp4_group_gemm":
+            case "trimul" | "mla_decode_nvidia" | "nvfp4_group_gemm" | "mixed_mla":
                 from tinker_cookbook.recipes.ttt.env_gpu_mode import GpuModeEnv
                 return GpuModeEnv
             case _:
@@ -190,7 +190,7 @@ class SingleProblemDatasetBuilder(RLDatasetBuilder):
 
 # Valid dataset names
 VALID_DATASET_NAMES = {
-    "cp", "ac1", "ac2", "ale_bench", "denoising", "erdos", "trimul", "mla_decode_nvidia", "nvfp4_group_gemm"
+    "cp", "ac1", "ac2", "ale_bench", "denoising", "erdos", "trimul", "mla_decode_nvidia", "nvfp4_group_gemm", "mixed_mla"
 }
 
 

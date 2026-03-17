@@ -1,3 +1,6 @@
+import json
+import os
+import threading
 from typing import Any
 
 from tinker_cookbook.utils import logtree
@@ -6,6 +9,7 @@ from tasks.gpu_mode.task import run_gpu_mode_task
 from tasks.gpu_mode.prompt_trimul import TRIMUL_IMPROVEMENT_TEMPLATE_V0
 from tasks.gpu_mode.prompt_mla_decode import MLA_DECODE_PROMPT_V1, MLA_DECODE_IMPROVEMENT_TEMPLATE_V1
 from tasks.gpu_mode.prompt_nvfp4_group_gemm import NVFP4_GROUP_GEMM_IMPROVEMENT_TEMPLATE_V1
+from tasks.gpu_mode.prompt_mixed_mla import MIXED_MLA_IMPROVEMENT_TEMPLATE_V0
 
 from tinker_cookbook.recipes.ttt.state import GpuModeState, State
 from tinker_cookbook.recipes.ttt.env_ttt import BaseTTTEnv
@@ -53,6 +57,13 @@ class GpuModeEnv(BaseTTTEnv):
                 self.target = 0  # Unknown target; optimize runtime
                 self.gpu_type = "B200"
                 self.task_name = "nvfp4_group_gemm"
+                self.score_scale = self.config.gpu_mode_score_scale
+                self.app_name = "discord-bot-runner"
+            case "mixed_mla":
+                self.improvement_prompt = MIXED_MLA_IMPROVEMENT_TEMPLATE_V0
+                self.target = 0  # Unknown target; optimize runtime vs a8w8 reference
+                self.gpu_type = "MI355X"
+                self.task_name = "mixed_mla"
                 self.score_scale = self.config.gpu_mode_score_scale
                 self.app_name = "discord-bot-runner"
             case _:
@@ -103,7 +114,11 @@ class GpuModeEnv(BaseTTTEnv):
             if (parsed_code is None) or (parsed_code.strip() == '') or ("def custom_kernel" not in parsed_code):
                 return False
             return True
-        
+        elif self.dataset_name == "mixed_mla":
+            if (parsed_code is None) or (parsed_code.strip() == '') or ("def custom_kernel" not in parsed_code):
+                return False
+            return True
+
         else:
             raise ValueError(f"Unknown dataset name: {self.dataset_name}")
 
@@ -151,12 +166,39 @@ class GpuModeEnv(BaseTTTEnv):
         if outs.get("benchmark_details"):
             obs_parts.append(f"\nPer-benchmark timing:\n{outs['benchmark_details']}")
         observation = "\n".join(obs_parts)
-        return GpuModeState(
+        state = GpuModeState(
             timestep=step_idx,
             code=parsed_code,
             value=outs["performance"],  # higher = better, performance is -runtime
             observation=observation,
         )
+        # Append to kernel log (every correct kernel, never truncated)
+        self._append_kernel_log(state, outs)
+        return state
+
+    # ------------------------------------------------------------------
+    # Append-only kernel log — survives sampler buffer eviction
+    # ------------------------------------------------------------------
+    _kernel_log_lock = threading.Lock()
+
+    def _append_kernel_log(self, state: GpuModeState, outs: dict[str, Any]):
+        """Append kernel code + runtime to a JSONL file for post-run analysis."""
+        log_dir = getattr(self.config, "log_path", None)
+        if not log_dir:
+            return
+        log_file = os.path.join(log_dir, "kernel_log.jsonl")
+        entry = {
+            "id": state.id,
+            "timestep": state.timestep,
+            "runtime_us": -state.value if state.value is not None else None,
+            "score": outs.get("score", 0.0),
+            "msg": outs.get("msg", ""),
+            "code": state.code,
+        }
+        with self._kernel_log_lock:
+            os.makedirs(log_dir, exist_ok=True)
+            with open(log_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
 
     def _build_metrics(
         self,
