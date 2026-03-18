@@ -127,6 +127,7 @@ async def run_remote_eval_task(
     try:
         # Pipe submission code via stdin, write to /matx (shared across nodes).
         # srun allocates a GPU, apptainer runs eval inside ROCm container.
+        triton_cache = os.environ.get("MIXED_MLA_TRITON_CACHE", "/matx/u/knatalia/.triton_cache")
         remote_cmd = (
             f"TMPF=$(mktemp /matx/u/knatalia/submission_XXXXXX.py) && "
             f"cat > $TMPF && "
@@ -135,6 +136,7 @@ async def run_remote_eval_task(
             f"bash -c '"
             f"APPTAINERENV_LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu "
             f"APPTAINERENV_PYTHONPATH={pypackages} "
+            f"APPTAINERENV_TRITON_CACHE_DIR={triton_cache} "
             f"/usr/bin/apptainer exec --rocm --bind /matx {sif} "
             f"{apptainer_python} {eval_script} $TMPF {task_dir}"
             f"' ; "
