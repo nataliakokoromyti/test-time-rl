@@ -1,31 +1,18 @@
-MIXED_MLA_IMPROVEMENT_TEMPLATE_V0 = '''You are an expert AMD HIP kernel engineer tasked with implementing a highly optimized MLA (Multi-head Latent Attention) decode kernel for AMD MI355X.
+MIXED_MLA_IMPROVEMENT_TEMPLATE_V0 = '''You are an expert Triton engineer tasked with writing highly optimized Triton kernels for AMD MI355X.
 
-This is the inner attention kernel from DeepSeek R1's forward_absorb MLA path.
-The absorbed query and compressed KV cache are provided directly — you implement the
-attention computation with variable-length batching.
+Below is the MLA (Multi-head Latent Attention) decode kernel you need to optimize. This is the inner attention kernel from DeepSeek R1's forward_absorb MLA path. The absorbed query and compressed KV cache are provided directly — you implement the attention computation with variable-length batching.
 
-The reference uses aiter's a8w8 persistent MLA kernel (fp8 Q + fp8 KV, mla_decode_fwd),
-which is ~2-3x faster than bf16 on MI355X with negligible accuracy loss. However, you will have to unlock SOTA PERFORMANCE using HIP ONLY. The only deviation you are allowed to do is using -when necessary- inline AMD assembly to optimize even further.
+## Config
 
-## DeepSeek R1 Forward-Absorb MLA Config
-
-| Parameter | Value | Notes |
-|---|---|---|
-| num_heads | 16 | Query heads (after TP split) |
-| num_kv_heads | 1 | Single shared latent KV head |
-| kv_lora_rank | 512 | Latent dimension |
-| qk_rope_head_dim | 64 | RoPE embedding dimension |
-| qk_head_dim | 576 | kv_lora_rank + qk_rope_head_dim (absorbed q/k dim) |
-| v_head_dim | 512 | = kv_lora_rank (output dim) |
-| sm_scale | 1/sqrt(576) | ~0.04167 |
-| q dtype | bfloat16 | Input always bf16; reference quantizes to fp8 on-the-fly |
-| kv dtype | bf16 / fp8 / mxfp4 | All three provided simultaneously |
-| mode | decode | q_seq_len=1, kv_seq_len up to 8k |
-
-## KV Buffer Format (forward_absorb)
-
-- Full 576 dims used as keys (for Q@K^T score computation)
-- First 512 dims (kv_lora_rank) used as values (for output computation)
+| Parameter | Value |
+|---|---|
+| num_heads | 16 |
+| kv_lora_rank | 512 |
+| qk_rope_head_dim | 64 |
+| qk_head_dim | 576 (kv_lora_rank + qk_rope_head_dim) |
+| v_head_dim | 512 |
+| sm_scale | 1/sqrt(576) |
+| mode | decode (q_seq_len=1, kv_seq_len up to 8k) |
 
 ## Input
 
@@ -33,17 +20,16 @@ A tuple `(q, kv_data, qo_indptr, kv_indptr, config)`:
 
 ```
 q:          (total_q, 16, 576)     bfloat16  — absorbed queries
-kv_data:    dict with three KV cache formats:
-  "bf16":   Tensor (total_kv, 1, 576)              bfloat16
+kv_data:    dict — three KV cache formats:
+  "bf16":   Tensor (total_kv, 1, 576) bfloat16
   "fp8":    (Tensor, Tensor)  kv_buffer fp8 + scalar scale
   "mxfp4":  (Tensor, Tensor)  kv_buffer fp4x2 + fp8_e8m0 scale
-qo_indptr:  (batch_size + 1,)      int32     — query segment pointers
-kv_indptr:  (batch_size + 1,)      int32     — KV segment pointers
-config:     dict                              — MLA parameters
+qo_indptr:  (batch_size + 1,) int32 — query segment pointers
+kv_indptr:  (batch_size + 1,) int32 — KV segment pointers
+config:     dict — batch_size, num_heads, kv_lora_rank, qk_head_dim, v_head_dim, q_seq_len, kv_seq_len, sm_scale
 ```
 
-Config dict keys: batch_size, num_heads (16), num_kv_heads (1), qk_head_dim (576),
-kv_lora_rank (512), qk_rope_head_dim (64), v_head_dim (512), q_seq_len, kv_seq_len, sm_scale.
+KV buffer: full 576 dims used as keys, first 512 dims used as values.
 
 ## Output
 
@@ -51,113 +37,289 @@ kv_lora_rank (512), qk_rope_head_dim (64), v_head_dim (512), q_seq_len, kv_seq_l
 attention_output: (total_q, 16, 512) bfloat16
 ```
 
-## KV Cache Quantization
-
-| dtype | kv_buffer | kv_scale | Bandwidth |
-|---|---|---|---|
-| bf16 | bfloat16 (total_kv, 1, 576) | None | 1x |
-| fp8 | fp8 (total_kv, 1, 576) | scalar float32 | 2x savings |
-| mxfp4 | fp4x2 (total_kv, 1, 288) | fp8_e8m0 (total_kv, N_blocks) | 4x savings |
-
-For MXFP4: block_size=32, so 576/32=18 scale blocks per token. Two fp4 E2M1 values packed per byte.
-Dequantize: unpack fp4->float, multiply by 2^(e8m0_exponent - 127) per block.
-
-## Reference Implementation (aiter a8w8 persistent kernel)
-
-This is the reference your submission is checked against (rtol=2e-02, atol=8e-03):
-
-```python
-import torch
-from task import input_t, output_t
-from aiter.mla import mla_decode_fwd
-from aiter import dtypes as aiter_dtypes
-from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
-
-FP8_DTYPE = aiter_dtypes.fp8
-NUM_HEADS = 16
-NUM_KV_HEADS = 1
-QK_HEAD_DIM = 576
-V_HEAD_DIM = 512
-SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
-PAGE_SIZE = 1
-NUM_KV_SPLITS = 32
-
-def quantize_fp8(tensor):
-    """Dynamic per-tensor FP8 quantization."""
-    finfo = torch.finfo(FP8_DTYPE)
-    amax = tensor.abs().amax().clamp(min=1e-12)
-    scale = amax / finfo.max
-    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
-    return fp8_tensor, scale.to(torch.float32).reshape(1)
-
-def ref_kernel(data):
-    q, kv_data, qo_indptr, kv_indptr, config = data
-    # Quantize Q to fp8
-    q_input, q_scale = quantize_fp8(q)
-    # Use fp8 KV cache
-    kv_buffer_fp8, kv_scale = kv_data["fp8"]
-    # Build persistent-mode metadata, then call:
-    # mla_decode_fwd(q, kv_buffer_4d, output, qo_indptr, kv_indptr, kv_indices,
-    #                kv_last_page_len, max_q_len, page_size, nhead_kv, sm_scale,
-    #                logit_cap, num_kv_splits, q_scale, kv_scale, intra_batch_mode, **meta)
-    # Returns: (total_q, 16, 512) bfloat16
-```
-
-## Available Libraries and APIs
-
-**aiter** (AMD's GPU kernel library):
-- `from aiter import dtypes as aiter_dtypes` — `aiter_dtypes.fp8`, `aiter_dtypes.fp4x2`, `aiter_dtypes.fp8_e8m0`
-- `from aiter import per_tensor_quant` — fast GPU-side FP8 quantization (no CPU sync)
-- `from aiter.mla import mla_decode_fwd` — persistent MLA decode kernel
-- `from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1` — metadata for persistent mode
-- `from aiter.utility.fp4_utils import dynamic_mxfp4_quant, mxfp4_to_f32, e8m0_to_f32` — MXFP4 utilities
-
-**HIP kernels** (custom C++ compiled at runtime):
-- Write HIP C++ source, compile with hipcc (`/opt/rocm/bin/hipcc --offload-arch=gfx950`)
-- Load via `ctypes.CDLL`, call kernel launch functions
-- Use `__builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8` for MFMA fp8 matrix multiply
-- gfx950 = MI355X architecture
-
-**Triton** is also available for ROCm.
-
-## MI355X-Specific Tips
-
-- MI355X has MFMA (Matrix Fused Multiply-Add) instructions for fp8 and fp4
-- `__builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8` does 32x32x16 fp8 matmul in hardware
-- Use `per_tensor_quant` from aiter instead of manual quantize_fp8 to avoid CPU-GPU sync from `.item()`
-- For split-K: use atomicAdd for work counter, threadfence + atomicAdd for done counter
-- Shared memory (LDS) on gfx950: 64KB per workgroup
-- 304 Compute Units on MI355X — cap grid size accordingly
-- MXFP4 gives 4x bandwidth savings but requires dequant in registers or via LUT
-
-## Optimization Ideas (pick ONE to try)
-
-- Increase KV tile size (KVT) from 32 to 64 to reduce loop overhead
-- Use ds_read_b64 or ds_read_b128 instead of ds_read_u8 for V accumulation
-- Tune the split-K heuristic (_ns function) for specific batch/kv_len combos
-- Unroll the inner token loop more aggressively
-- Use async global loads (buffer_load) to overlap with compute
-- Adjust MFMA scheduling (s_setprio, s_waitcnt tuning)
-- Pack multiple V elements per LDS read to reduce LDS traffic
-
-## Benchmark Cases (with seeds)
-
-Your submission will be benchmarked on these 8 cases (ranking = geometric mean of latencies):
-
-| batch_size | q_seq_len | kv_seq_len | seed |
-|---|---|---|---|
-| 4 | 1 | 1024 | 4217 |
-| 4 | 1 | 8192 | 4220 |
-| 32 | 1 | 1024 | 5412 |
-| 32 | 1 | 8192 | 5415 |
-| 64 | 1 | 1024 | 1357 |
-| 64 | 1 | 8192 | 1360 |
-| 256 | 1 | 1024 | 9823 |
-| 256 | 1 | 8192 | 9826 |
-
 ## Accuracy
 
-Submissions are checked against the a8w8 fp8 reference with `rtol=2e-02, atol=8e-03`.
+Checked against aiter a8w8 fp8 reference with `rtol=2e-02, atol=8e-03`.
+
+To warm you up, here is an example which is correct but slow (geomean ~1014 µs). Your code should be as optimized as possible.
+
+```python
+"""
+MLA Decode Triton Kernel for MI355X (gfx950).
+Split-K with tiled V accumulation. Scores computed once per KV block.
+"""
+
+import torch
+import triton
+import triton.language as tl
+from task import input_t, output_t
+
+SM_SCALE = 1.0 / (576 ** 0.5)
+
+
+@triton.jit
+def _mla_phase1(
+    Q, KV, KV_indptr,
+    PO, PM, PL,
+    sm_scale,
+    num_splits: tl.constexpr,
+    stride_q_batch, stride_q_head, stride_kv_tok,
+    stride_po_batch, stride_po_head, stride_po_split,
+    stride_pm_batch, stride_pm_head,
+    BLOCK_KV: tl.constexpr,
+    D_TILE: tl.constexpr,
+    N_D_TILES: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
+    V_TILE: tl.constexpr,
+    N_V_TILES: tl.constexpr,
+    MAX_KV_BLOCKS: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_split = tl.program_id(1)
+    batch_idx = pid_bh // 16
+    head_idx = pid_bh % 16
+
+    kv_start = tl.load(KV_indptr + batch_idx)
+    kv_end = tl.load(KV_indptr + batch_idx + 1)
+    kv_len = kv_end - kv_start
+
+    split_size = tl.cdiv(kv_len, num_splits)
+    my_start = kv_start + pid_split * split_size
+    my_end = tl.minimum(kv_start + pid_split * split_size + split_size, kv_end)
+
+    q_ptr = Q + batch_idx * stride_q_batch + head_idx * stride_q_head
+
+    tok_offs = tl.arange(0, BLOCK_KV)
+    d_offs = tl.arange(0, D_TILE)
+    vt_offs = tl.arange(0, V_TILE)
+
+    m_i: tl.float32 = float("-inf")
+    l_i: tl.float32 = 0.0
+
+    # 8 V-tile accumulators (V_TILE=64 each, 512 total)
+    acc0 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc1 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc2 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc3 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc4 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc5 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc6 = tl.zeros([V_TILE], dtype=tl.float32)
+    acc7 = tl.zeros([V_TILE], dtype=tl.float32)
+
+    for block_idx in range(MAX_KV_BLOCKS):
+        tok_start = my_start + block_idx * BLOCK_KV
+        tok_ids = tok_start + tok_offs
+        tok_valid = tok_ids < my_end
+
+        # Tiled QK dot product (576 dims in 9 tiles of 64)
+        scores = tl.zeros([BLOCK_KV], dtype=tl.float32)
+        for dt in range(N_D_TILES):
+            d_start = dt * D_TILE
+            d_off = d_start + d_offs
+            d_mask = d_off < QK_DIM
+
+            q_tile = tl.load(q_ptr + d_off, mask=d_mask, other=0.0).to(tl.float32)
+            kv_ptrs = KV + tok_ids[:, None] * stride_kv_tok + d_off[None, :]
+            kv_tile = tl.load(kv_ptrs, mask=tok_valid[:, None] & d_mask[None, :],
+                              other=0.0).to(tl.float32)
+            scores += tl.sum(kv_tile * q_tile[None, :], axis=1)
+
+        scores = scores * sm_scale
+        scores = tl.where(tok_valid, scores, float("-inf"))
+
+        # Online softmax
+        block_max = tl.max(scores)
+        new_m = tl.maximum(m_i, block_max)
+        alpha = tl.exp(m_i - new_m)
+        p = tl.exp(scores - new_m)
+        p = tl.where(tok_valid, p, 0.0)
+        l_i = l_i * alpha + tl.sum(p)
+        m_i = new_m
+
+        # Rescale all V accumulators
+        acc0 *= alpha
+        acc1 *= alpha
+        acc2 *= alpha
+        acc3 *= alpha
+        acc4 *= alpha
+        acc5 *= alpha
+        acc6 *= alpha
+        acc7 *= alpha
+
+        # Accumulate V tiles (first 512 dims of KV buffer)
+        v_base = KV + tok_ids[:, None] * stride_kv_tok
+        v_mask = tok_valid[:, None]
+
+        vd = vt_offs
+        acc0 += tl.sum(p[:, None] * tl.load(v_base + (0 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc1 += tl.sum(p[:, None] * tl.load(v_base + (1 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc2 += tl.sum(p[:, None] * tl.load(v_base + (2 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc3 += tl.sum(p[:, None] * tl.load(v_base + (3 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc4 += tl.sum(p[:, None] * tl.load(v_base + (4 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc5 += tl.sum(p[:, None] * tl.load(v_base + (5 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc6 += tl.sum(p[:, None] * tl.load(v_base + (6 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+        acc7 += tl.sum(p[:, None] * tl.load(v_base + (7 * V_TILE + vd)[None, :], mask=v_mask, other=0.0).to(tl.float32), axis=0)
+
+    # Store partials
+    po_base = (PO + batch_idx * stride_po_batch + head_idx * stride_po_head
+               + pid_split * stride_po_split)
+    tl.store(po_base + 0 * V_TILE + vt_offs, acc0)
+    tl.store(po_base + 1 * V_TILE + vt_offs, acc1)
+    tl.store(po_base + 2 * V_TILE + vt_offs, acc2)
+    tl.store(po_base + 3 * V_TILE + vt_offs, acc3)
+    tl.store(po_base + 4 * V_TILE + vt_offs, acc4)
+    tl.store(po_base + 5 * V_TILE + vt_offs, acc5)
+    tl.store(po_base + 6 * V_TILE + vt_offs, acc6)
+    tl.store(po_base + 7 * V_TILE + vt_offs, acc7)
+
+    pm_off = batch_idx * stride_pm_batch + head_idx * stride_pm_head + pid_split
+    tl.store(PM + pm_off, m_i)
+    tl.store(PL + pm_off, l_i)
+
+
+@triton.jit
+def _mla_phase2(
+    PO, PM, PL, Out,
+    num_splits: tl.constexpr,
+    stride_po_batch, stride_po_head, stride_po_split,
+    stride_pm_batch, stride_pm_head,
+    stride_o_batch, stride_o_head,
+    V_DIM: tl.constexpr,
+    V_TILE: tl.constexpr,
+    N_V_TILES: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    batch_idx = pid_bh // 16
+    head_idx = pid_bh % 16
+
+    pm_base = batch_idx * stride_pm_batch + head_idx * stride_pm_head
+
+    # Find global max
+    global_m: tl.float32 = float("-inf")
+    for s in range(num_splits):
+        global_m = tl.maximum(global_m, tl.load(PM + pm_base + s))
+
+    # Compute normalizer
+    global_l: tl.float32 = 0.0
+    for s in range(num_splits):
+        m_s = tl.load(PM + pm_base + s)
+        l_s = tl.load(PL + pm_base + s)
+        global_l += l_s * tl.exp(m_s - global_m)
+    inv_l = 1.0 / global_l
+
+    # Pre-compute per-split scales
+    po_base = PO + batch_idx * stride_po_batch + head_idx * stride_po_head
+    o_base = Out + batch_idx * stride_o_batch + head_idx * stride_o_head
+    vt_offs = tl.arange(0, V_TILE)
+
+    for vt in range(N_V_TILES):
+        v_off = vt * V_TILE
+        result = tl.zeros([V_TILE], dtype=tl.float32)
+        for s in range(num_splits):
+            m_s = tl.load(PM + pm_base + s)
+            scale = tl.exp(m_s - global_m) * inv_l
+            partial = tl.load(po_base + s * stride_po_split + v_off + vt_offs)
+            result += partial * scale
+        tl.store(o_base + v_off + vt_offs, result.to(tl.bfloat16))
+
+
+def custom_kernel(data: input_t) -> output_t:
+    q, kv_data, qo_indptr, kv_indptr, config = data
+
+    batch_size = config["batch_size"]
+    num_heads = config["num_heads"]
+    kv_seq_len = config["kv_seq_len"]
+    v_head_dim = config["v_head_dim"]
+    qk_head_dim = config["qk_head_dim"]
+    total_q = q.shape[0]
+
+    kv_buffer = kv_data["bf16"].squeeze(1)  # (total_kv, 576)
+
+    D_TILE = 64
+    V_TILE = 64
+    BLOCK_KV = 16
+    N_V_TILES = v_head_dim // V_TILE       # 8
+    N_D_TILES = (qk_head_dim + D_TILE - 1) // D_TILE  # 9
+
+    # Adaptive splits — target ~2048+ thread blocks for good CU occupancy
+    # MI355X has 304 CUs, want at least ~4 waves per CU
+    total_heads = batch_size * num_heads  # grid dim 0
+    if kv_seq_len <= 1024:
+        if total_heads <= 64:
+            num_splits = 32  # 64*32=2048 blocks
+        elif total_heads <= 512:
+            num_splits = 8
+        else:
+            num_splits = 4
+    else:
+        if total_heads <= 64:
+            num_splits = 64  # 64*64=4096 blocks, each handles 128 tokens
+        elif total_heads <= 512:
+            num_splits = 16
+        else:
+            num_splits = 8
+
+    # Max KV blocks any split could process
+    max_split_tokens = (kv_seq_len + num_splits - 1) // num_splits
+    MAX_KV_BLOCKS = (max_split_tokens + BLOCK_KV - 1) // BLOCK_KV
+
+    partial_o = torch.empty((batch_size, num_heads, num_splits, v_head_dim),
+                            dtype=torch.float32, device="cuda")
+    partial_m = torch.full((batch_size, num_heads, num_splits),
+                           float("-inf"), dtype=torch.float32, device="cuda")
+    partial_l = torch.zeros((batch_size, num_heads, num_splits),
+                            dtype=torch.float32, device="cuda")
+
+    grid1 = (batch_size * num_heads, num_splits)
+    _mla_phase1[grid1](
+        q, kv_buffer, kv_indptr,
+        partial_o, partial_m, partial_l,
+        SM_SCALE, num_splits,
+        q.stride(0), q.stride(1), kv_buffer.stride(0),
+        partial_o.stride(0), partial_o.stride(1), partial_o.stride(2),
+        partial_m.stride(0), partial_m.stride(1),
+        BLOCK_KV=BLOCK_KV,
+        D_TILE=D_TILE,
+        N_D_TILES=N_D_TILES,
+        QK_DIM=qk_head_dim,
+        V_DIM=v_head_dim,
+        V_TILE=V_TILE,
+        N_V_TILES=N_V_TILES,
+        MAX_KV_BLOCKS=MAX_KV_BLOCKS,
+    )
+
+    output = torch.empty((total_q, num_heads, v_head_dim), dtype=torch.bfloat16, device="cuda")
+    grid2 = (batch_size * num_heads,)
+    _mla_phase2[grid2](
+        partial_o, partial_m, partial_l, output,
+        num_splits,
+        partial_o.stride(0), partial_o.stride(1), partial_o.stride(2),
+        partial_m.stride(0), partial_m.stride(1),
+        output.stride(0), output.stride(1),
+        V_DIM=v_head_dim,
+        V_TILE=V_TILE,
+        N_V_TILES=N_V_TILES,
+    )
+
+    return output
+
+```
+
+## Benchmark Cases
+
+| batch_size | kv_seq_len |
+|---|---|
+| 4 | 1024 |
+| 4 | 8192 |
+| 32 | 1024 |
+| 32 | 8192 |
+| 64 | 1024 |
+| 64 | 8192 |
+| 256 | 1024 |
+| 256 | 8192 |
+
+Ranking is by geometric mean of latencies.
 
 Here is the last code we ran:
 
@@ -170,8 +332,8 @@ Here is the last code we ran:
 Rules:
 - Define all of your code in one final ```python ``` block.
 - The entrypoint to your code must be named `custom_kernel`.
-- You will be writing HIP C++ kernels compiled at runtime via `load_inline`, targeting AMD MI355X (gfx950, ROCm).
+- You will be writing Triton kernels targeting AMD MI355X (gfx950, ROCm).
 - All three KV cache formats (bf16, fp8, mxfp4) are available — choose the best strategy.
-- Avoid `.item()` or `.cpu()` calls in the hot path — they cause CPU-GPU sync.
+- Avoid `.item()` or `.cpu()` calls in the hot path.
 - Include a short docstring at the top summarizing your approach.
 '''
