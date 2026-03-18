@@ -33,7 +33,7 @@ class CLIConfig:
     problem_idx: str = "1818057f"
     test_num_rollouts: int = 1
     # Training hyperparameters
-    group_size: int = 64
+    group_size: int = 8
     groups_per_batch: int = 8
     learning_rate: float = 4e-5
     num_epochs: int = 50
@@ -72,8 +72,8 @@ class CLIConfig:
     sweep_hyperparams: bool = False
     max_hyperparam_combos: int = 16
     num_cpus_per_task: int = 1
-    eval_timeout: int = 1000
-    dataset_timeout: int = 1000
+    eval_timeout: int = 530
+    dataset_timeout: int = 530
     sampler_type: str = "puct_backprop"
     initial_exp_type: str = "random"  # "best_available", "none", "random"
 
