@@ -9,16 +9,12 @@ unset RAY_ADDRESS
 
 # Required API keys — set these before running
 # export TINKER_API_KEY="..."
-# export WANDB_API_KEY="..."
-# export WANDB_ENTITY="..."
 
 # AMD cluster eval config
 export MIXED_MLA_REMOTE_EVAL=1
 export MIXED_MLA_REMOTE_DIR=/matx/u/knatalia/tttamd
 
-# W&B config
-wandb_project="ttt-discover-gpu"
-wandb_name="mixed-mla-seed0"
+export WANDB_MODE=disabled
 
 python -m tinker_cookbook.recipes.ttt.train \
   env=mixed_mla \
@@ -39,6 +35,4 @@ python -m tinker_cookbook.recipes.ttt.train \
   kl_penalty_coef=0.1 \
   adv_estimator=entropic_adaptive_beta \
   adv_estimator_beta=0.693147 \
-  seed=0 \
-  wandb_project="${wandb_project}" \
-  wandb_name="${wandb_name}"
+  seed=0
