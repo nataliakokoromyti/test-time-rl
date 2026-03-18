@@ -16,7 +16,7 @@ export MIXED_MLA_REMOTE_DIR=/matx/u/knatalia/tttamd
 
 export WANDB_MODE=disabled
 
-C:/Users/natal/anaconda/python.exe -m tinker_cookbook.recipes.ttt.train \
+python3 -m tinker_cookbook.recipes.ttt.train \
   env=mixed_mla \
   model_name="openai/gpt-oss-120b" \
   lora_rank=32 \
