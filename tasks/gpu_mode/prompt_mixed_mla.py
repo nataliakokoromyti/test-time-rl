@@ -332,8 +332,16 @@ Here is the last code we ran:
 Rules:
 - Define all of your code in one final ```python ``` block.
 - The entrypoint to your code must be named `custom_kernel`.
-- You will be writing Triton kernels targeting AMD MI355X (gfx950, ROCm).
+- You will be using Triton 3.5.1 and your kernels will be run on an AMD MI355X GPU (gfx950, ROCm).
 - All three KV cache formats (bf16, fp8, mxfp4) are available — choose the best strategy.
 - Avoid `.item()` or `.cpu()` calls in the hot path.
+- You are allowed to use torch.compile().
 - Include a short docstring at the top summarizing your approach.
+
+Important rules in Triton 3.5.1:
+- `tl.load` does not have an argument called `dtype`. Never use it like `tl.load(..., dtype=...)`.
+- Triton dtypes are not callable, so never use them like `tl.float16(1.0)`, `tl.float32(0.0)`.
+- `tl.arange(start, end)`: range length (end - start) must be power-of-2, start and end must be `tl.constexpr`.
+- `tl.range(start, end, step, num_stages)`: keep loop index type stable, don't reassign it; num_stages must be `tl.constexpr`.
+- Do not use scalar indexing like `x[0]` inside a Triton kernel. Triton tensors are SIMD vectors.
 '''
