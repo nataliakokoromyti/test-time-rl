@@ -208,9 +208,9 @@ def _start_worker(task_dir):
 
 
 def serve(queue_dir, task_dir, gpu_id=None):
-    if gpu_id is not None:
-        os.environ["HIP_VISIBLE_DEVICES"]  = str(gpu_id)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Each SLURM job gets exactly 1 GPU; SLURM/ROCm masks it as device 0.
+    # Don't override HIP_VISIBLE_DEVICES — that would mask the only available GPU.
+    # gpu_id is kept for logging only.
 
     pending    = Path(queue_dir) / "pending"
     processing = Path(queue_dir) / "processing"
