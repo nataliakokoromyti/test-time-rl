@@ -18,7 +18,7 @@ export WANDB_MODE=disabled
 export KMP_DUPLICATE_LIB_OK=TRUE
 export PYTHONUTF8=1
 
-/c/Users/natal/anaconda/python.exe -m tinker_cookbook.recipes.ttt.train \
+/mnt/c/Users/natal/anaconda/python.exe -m tinker_cookbook.recipes.ttt.train \
   env=mixed_mla \
   model_name="openai/gpt-oss-120b" \
   lora_rank=32 \
