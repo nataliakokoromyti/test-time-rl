@@ -133,13 +133,13 @@ async def run_remote_eval_task(
             f"cat > $TMPF && "
             f"srun --account={slurm_account} --partition={slurm_partition} "
             f"--gres=gpu:1 --time={slurm_time} "
-            f"bash -c '"
+            f'bash -c "'
             f"APPTAINERENV_LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu "
             f"APPTAINERENV_PYTHONPATH={pypackages} "
             f"APPTAINERENV_TRITON_CACHE_DIR={triton_cache} "
             f"/usr/bin/apptainer exec --rocm --bind /matx {sif} "
             f"{apptainer_python} {eval_script} $TMPF {task_dir}"
-            f"' ; "
+            f'" ; '
             f"rm -f $TMPF"
         )
 
