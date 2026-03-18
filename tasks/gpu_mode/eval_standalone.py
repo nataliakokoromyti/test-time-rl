@@ -29,8 +29,8 @@ import time
 
 def _worker_init(task_dir, submission_dir):
     """Called once when the Pool(1) worker starts."""
-    sys.path.insert(0, submission_dir)
     sys.path.insert(0, task_dir)
+    sys.path.insert(0, submission_dir)  # submission_dir must win over task_dir
 
 
 def _clone(data):
