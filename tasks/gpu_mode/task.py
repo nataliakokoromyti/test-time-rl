@@ -171,11 +171,19 @@ async def run_remote_eval_task(
     except Exception as e:
         return get_gpu_mode_error(f"SSH/SLURM error: {e}")
 
-    # Parse JSON output from eval_standalone.py
+    # Parse JSON output from eval_standalone.py.
+    # aiter prints log lines to stdout, so find the last line that parses as JSON.
     import json
-    try:
-        parsed = json.loads(output)
-    except json.JSONDecodeError:
+    parsed = None
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                parsed = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if parsed is None:
         return get_gpu_mode_error(f"Failed to parse remote eval JSON: {output[:500]}")
 
     if not parsed.get("success"):
