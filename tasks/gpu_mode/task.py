@@ -114,23 +114,30 @@ async def run_remote_eval_task(
     if not remote_dir:
         return get_gpu_mode_error("MIXED_MLA_REMOTE_DIR not set")
 
-    remote_python = os.environ.get("MIXED_MLA_REMOTE_PYTHON", "python3")
     slurm_account = os.environ.get("MIXED_MLA_SLURM_ACCOUNT", "matx")
     slurm_partition = os.environ.get("MIXED_MLA_SLURM_PARTITION", "matx-interactive")
     slurm_time = os.environ.get("MIXED_MLA_SLURM_TIME", "30:00")
+    sif = os.environ.get("MIXED_MLA_SIF", "/matx/u/knatalia/rocm_pytorch.sif")
+    pypackages = os.environ.get("MIXED_MLA_PYPACKAGES", "/matx/u/knatalia/pypackages")
 
     eval_script = f"{remote_dir}/tasks/gpu_mode/eval_standalone.py"
     task_dir = f"{remote_dir}/gpu_mode/mixed-mla"
+    apptainer_python = "/opt/venv/bin/python3"
 
     try:
-        # Pipe submission code via stdin to avoid escaping issues.
-        # SSH to login node, srun allocates a GPU, runs eval_standalone.py.
+        # Pipe submission code via stdin, write to /matx (shared across nodes).
+        # srun allocates a GPU, apptainer runs eval inside ROCm container.
         remote_cmd = (
-            f"TMPF=$(mktemp /tmp/submission_XXXXXX.py) && "
+            f"TMPF=$(mktemp /matx/u/knatalia/submission_XXXXXX.py) && "
             f"cat > $TMPF && "
             f"srun --account={slurm_account} --partition={slurm_partition} "
             f"--gres=gpu:1 --time={slurm_time} "
-            f"{remote_python} {eval_script} $TMPF {task_dir} ; "
+            f"bash -c '"
+            f"APPTAINERENV_LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu "
+            f"APPTAINERENV_PYTHONPATH={pypackages} "
+            f"/usr/bin/apptainer exec --rocm --bind /matx {sif} "
+            f"{apptainer_python} {eval_script} $TMPF {task_dir}"
+            f"' ; "
             f"rm -f $TMPF"
         )
 
