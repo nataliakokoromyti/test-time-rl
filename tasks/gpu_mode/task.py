@@ -92,12 +92,114 @@ def _release_gpu(gpu_id: int):
         _local_gpu_semaphores[gpu_id].release()
 
 
+async def run_server_queue_eval_task(
+    generation: str,
+    task_name: str,
+    score_scale: float,
+) -> dict:
+    """Submit eval to a persistent server via shared file queue on /matx.
+
+    Much faster than SSH+srun: no SLURM wait, no container startup, no aiter reimport.
+    Requires eval servers to be running (scripts/cluster/start_eval_servers.sh).
+
+    Env vars:
+        MIXED_MLA_SERVER_QUEUE — path to queue dir on cluster (e.g. /matx/u/knatalia/eval_queue)
+        MIXED_MLA_SSH_HOST     — SSH host to access the queue dir (default: "sc")
+        MIXED_MLA_EVAL_TIMEOUT — per-eval timeout in seconds (default: 530)
+    """
+    import uuid as _uuid
+
+    ssh_host   = os.environ.get("MIXED_MLA_SSH_HOST", "sc")
+    queue_dir  = os.environ.get("MIXED_MLA_SERVER_QUEUE")
+    timeout    = int(os.environ.get("MIXED_MLA_EVAL_TIMEOUT", "530"))
+    req_id     = str(_uuid.uuid4())
+
+    request    = json.dumps({"code": generation, "timeout": timeout})
+    pending    = f"{queue_dir}/pending/{req_id}.json"
+    done       = f"{queue_dir}/done/{req_id}.json"
+
+    try:
+        # Write request to queue via SSH
+        write_cmd = f"cat > {pending}"
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+            ssh_host, write_cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(
+            proc.communicate(input=request.encode("utf-8")),
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return get_gpu_mode_error(f"Failed to write to queue: {stderr.decode()[-200:]}")
+
+        # Poll for result
+        deadline = asyncio.get_event_loop().time() + timeout + 120
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(5)
+            poll_cmd = f"cat {done} 2>/dev/null || true"
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                ssh_host, poll_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            output = stdout.decode("utf-8", errors="replace").strip()
+            if not output:
+                continue
+            # Found result — parse it
+            parsed = None
+            for line in reversed(output.splitlines()):
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        parsed = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if parsed is None:
+                return get_gpu_mode_error(f"Failed to parse server result: {output[:300]}")
+
+            # Clean up done file
+            await asyncio.create_subprocess_exec(
+                "ssh", "-o", "BatchMode=yes", ssh_host, f"rm -f {done}",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+
+            if not parsed.get("success"):
+                return get_gpu_mode_error(parsed.get("msg", "Server eval failed"))
+
+            geomean_us = parsed["geomean_us"]
+            score = score_scale / geomean_us
+            return {
+                "score": score,
+                "msg": parsed["msg"],
+                "correctness": 1.0,
+                "performance": -geomean_us,
+                "benchmark_details": "\n".join(
+                    f"  benchmark {i}: {t:.1f} µs"
+                    for i, t in enumerate(parsed.get("timings_us", []))
+                ),
+            }
+
+        return get_gpu_mode_error(f"Server eval timed out after {timeout+120}s")
+
+    except Exception as e:
+        return get_gpu_mode_error(f"Server queue error: {e}")
+
+
 async def run_remote_eval_task(
     generation: str,
     task_name: str,
     score_scale: float,
 ) -> dict:
     """Run eval on a remote AMD cluster via SSH + SLURM. Training stays on laptop.
+
+    If MIXED_MLA_SERVER_QUEUE is set, delegates to run_server_queue_eval_task
+    (persistent server, much faster). Otherwise falls back to SSH+srun.
 
     SSH to login node (sc), then srun to get a GPU allocation on the compute node.
 
@@ -109,6 +211,10 @@ async def run_remote_eval_task(
         MIXED_MLA_SLURM_PARTITION — SLURM partition (default: "matx-interactive")
         MIXED_MLA_SLURM_TIME — SLURM time limit (default: "30:00")
     """
+    # Fast path: use persistent server queue if available
+    if os.environ.get("MIXED_MLA_SERVER_QUEUE"):
+        return await run_server_queue_eval_task(generation, task_name, score_scale)
+
     ssh_host = os.environ.get("MIXED_MLA_SSH_HOST", "sc")
     remote_dir = os.environ.get("MIXED_MLA_REMOTE_DIR")
     if not remote_dir:
