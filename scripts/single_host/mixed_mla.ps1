@@ -1,0 +1,28 @@
+$env:KMP_DUPLICATE_LIB_OK = "TRUE"
+$env:PYTHONUTF8 = "1"
+$env:WANDB_MODE = "disabled"
+$env:MIXED_MLA_REMOTE_EVAL = "1"
+$env:MIXED_MLA_REMOTE_DIR = "/matx/u/knatalia/tttamd"
+$env:PYTHONPATH = "$PWD;$PWD\tasks;$env:PYTHONPATH"
+# $env:TINKER_API_KEY = "..."
+
+python -m tinker_cookbook.recipes.ttt.train `
+  env=mixed_mla `
+  model_name="openai/gpt-oss-120b" `
+  lora_rank=32 `
+  learning_rate=4e-5 `
+  temperature=1.0 `
+  max_tokens=32768 `
+  two_phase_sampling=true `
+  phase1_max_tokens=26000 `
+  groups_per_batch=8 `
+  group_size=8 `
+  sampler_type=puct_backprop `
+  initial_exp_type=random `
+  num_epochs=50 `
+  eval_timeout=530 `
+  dataset_timeout=530 `
+  kl_penalty_coef=0.1 `
+  adv_estimator=entropic_adaptive_beta `
+  adv_estimator_beta=0.693147 `
+  seed=0
